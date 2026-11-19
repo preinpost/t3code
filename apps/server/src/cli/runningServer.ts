@@ -66,7 +66,8 @@ export const withServerClient = <A, E, R>(input: {
 /**
  * A command that changes state goes through the server when one runs, so the server applies
  * the change and its clients see it. With no server, the command writes locally while it holds
- * the ownership lock, so a server cannot start halfway through the write.
+ * the ownership lock, so a server cannot start halfway through the write. `offline` runs before
+ * the lock is taken and returns that write, so a failed setup leaves server state alone.
  */
 export const changeState = Effect.fn("cli.changeState")(function* <
   A,
@@ -74,6 +75,8 @@ export const changeState = Effect.fn("cli.changeState")(function* <
   LiveR,
   OfflineError,
   OfflineR,
+  SetupError,
+  SetupR,
 >(input: {
   readonly environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"];
   readonly config: ServerConfig.ServerConfig["Service"];
@@ -83,7 +86,7 @@ export const changeState = Effect.fn("cli.changeState")(function* <
     client: ServerClient,
     headers: ServerClientHeaders,
   ) => Effect.Effect<A, LiveError, LiveR>;
-  readonly offline: Effect.Effect<A, OfflineError, OfflineR>;
+  readonly offline: Effect.Effect<Effect.Effect<A, OfflineError, OfflineR>, SetupError, SetupR>;
 }) {
   const statePath = input.config.serverRuntimeStatePath;
   const runningServer = yield* readLiveServerRuntimeState(statePath);
@@ -105,6 +108,7 @@ export const changeState = Effect.fn("cli.changeState")(function* <
     liveFailure = Option.some({ origin, cause: viaServer.failure });
   }
 
+  const write = yield* input.offline;
   return yield* Effect.gen(function* () {
     // A server that died since it wrote its record cannot answer; only the lock tells them apart.
     yield* ServerOwnership.acquireServerOwnership(statePath).pipe(
@@ -119,6 +123,6 @@ export const changeState = Effect.fn("cli.changeState")(function* <
       }),
     );
     yield* clearPersistedServerRuntimeState(statePath);
-    return yield* input.offline;
+    return yield* write;
   }).pipe(Effect.scoped);
 });

@@ -68,7 +68,7 @@ const changeAccess = <A, LiveError, LiveR, OfflineError, OfflineR>(
     scopes: [AuthAccessWriteScope],
     label: "t3 auth cli",
     live,
-    offline,
+    offline: Effect.succeed(offline),
   });
 
 const ttlFlag = Flag.String("ttl").pipe(

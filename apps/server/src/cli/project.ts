@@ -340,7 +340,7 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
         const { layerProjectService } = yield* Effect.promise(
           () => import("../orchestration-v2/runtimeLayer.ts"),
         );
-        return yield* Effect.gen(function* () {
+        return Effect.gen(function* () {
           const snapshot = yield* getOfflineSnapshot();
           const projects = yield* ProjectService.ProjectService;
           return yield* run({
