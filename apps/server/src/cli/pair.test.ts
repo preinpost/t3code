@@ -14,6 +14,7 @@ import * as Cause from "effect/Cause";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -699,6 +700,7 @@ describe("auth session revoke", () => {
     { server: "absent", label: "writes the database when no server runs" },
     { server: "gone", label: "writes the database when the recorded server has stopped" },
     { server: "unreachable", label: "changes nothing when a running server does not answer" },
+    { server: "hangs", label: "changes nothing when a running server never finishes answering" },
   ] as const)("$label", ({ server }) =>
     provideCliTestLayers(
       Effect.gen(function* () {
@@ -716,7 +718,8 @@ describe("auth session revoke", () => {
             state: { ...baseState, pid: process.pid, port: 1, origin: "http://127.0.0.1:1" },
           });
         }
-        if (server === "unreachable") {
+        const serverRuns = server === "unreachable" || server === "hangs";
+        if (serverRuns) {
           yield* ServerOwnership.acquireServerOwnership(statePath).pipe(
             Effect.provide(ProcessRunner.layer),
           );
@@ -730,7 +733,8 @@ describe("auth session revoke", () => {
           baseDir,
           issued.sessionId,
         ]);
-        const revoke = yield* (
+        const requestStarted = Promise.withResolvers<void>();
+        const command =
           server === "answers"
             ? revokeCommand.pipe(
                 Effect.provideService(FetchHttpClient.Fetch, async (input, init) => {
@@ -741,8 +745,22 @@ describe("auth session revoke", () => {
                   return Response.json({ revoked: true });
                 }),
               )
-            : revokeCommand
-        ).pipe(Effect.exit);
+            : server === "hangs"
+              ? revokeCommand.pipe(
+                  Effect.provideService(FetchHttpClient.Fetch, (_input, init) => {
+                    requestStarted.resolve();
+                    return new Promise<Response>((_resolve, reject) =>
+                      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason)),
+                    );
+                  }),
+                )
+              : revokeCommand;
+        const running = yield* command.pipe(Effect.exit, Effect.forkChild);
+        if (server === "hangs") {
+          yield* Effect.promise(() => requestStarted.promise);
+          yield* TestClock.adjust("30 seconds");
+        }
+        const revoke = yield* Fiber.join(running);
         const listed = JSON.parse(
           yield* captureStdout(
             runCli(["auth", "session", "list", "--base-dir", baseDir, "--json"]),
@@ -755,7 +773,7 @@ describe("auth session revoke", () => {
             ? [{ path: "/api/auth/clients/revoke", body: { sessionId: issued.sessionId } }]
             : [],
         );
-        if (server === "unreachable") {
+        if (serverRuns) {
           assert.include(
             Cause.pretty(Exit.isFailure(revoke) ? revoke.cause : Cause.empty),
             "RunningServerRequestError",
@@ -766,7 +784,7 @@ describe("auth session revoke", () => {
         // The fake server revoked nothing, and the CLI's own short-lived session is always gone.
         assert.deepEqual(
           listed.map((session) => session.sessionId),
-          server === "answers" || server === "unreachable" ? [issued.sessionId] : [],
+          server === "answers" || serverRuns ? [issued.sessionId] : [],
         );
       }).pipe(Effect.scoped),
     ),

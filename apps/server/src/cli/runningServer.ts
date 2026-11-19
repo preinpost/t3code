@@ -33,6 +33,7 @@ export interface ServerClientHeaders {
 }
 
 const RUNNING_SERVER_TIMEOUT = Duration.seconds(30);
+const CLI_SESSION_TTL = Duration.minutes(2);
 
 const isUnanswered = (cause: unknown) =>
   Cause.isTimeoutError(cause) || (isHttpClientError(cause) && cause.response === undefined);
@@ -50,6 +51,8 @@ export const withServerClient = <A, E, R>(input: {
       scopes: input.scopes,
       subject: "cli",
       label: input.label,
+      // The release revokes it; this bounds it if the release never runs.
+      ttl: CLI_SESSION_TTL,
     }),
     (issued) =>
       HttpApiClient.make(EnvironmentHttpApi, { baseUrl: input.origin }).pipe(
