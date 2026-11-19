@@ -1,14 +1,6 @@
-import {
-  AuthAccessWriteScope,
-  AuthSessionId,
-  AuthStandardClientScopes,
-  EnvironmentHttpApi,
-} from "@t3tools/contracts";
+import { AuthAccessWriteScope, AuthSessionId, AuthStandardClientScopes } from "@t3tools/contracts";
 import * as Console from "effect/Console";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
-import * as FetchHttpClient from "effect/http/FetchHttpClient";
-import * as HttpApiClient from "effect/http-api/HttpApiClient";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as References from "effect/References";
@@ -25,7 +17,6 @@ import {
   formatSessionList,
 } from "../cliAuthFormat.ts";
 import * as ServerConfig from "../config.ts";
-import { readLiveServerRuntimeState } from "../serverRuntimeState.ts";
 import { authScopesFlag } from "./authScopes.ts";
 import {
   authLocationFlags,
@@ -33,6 +24,7 @@ import {
   DurationFromString,
   resolveCliAuthConfig,
 } from "./config.ts";
+import * as RunningServer from "./runningServer.ts";
 
 const runWithEnvironmentAuth = Effect.fn("auth.runWithEnvironmentAuth")(function* <A, E, R>(
   flags: CliAuthLocationFlags,
@@ -60,51 +52,24 @@ const runWithEnvironmentAuth = Effect.fn("auth.runWithEnvironmentAuth")(function
   );
 });
 
-const LIVE_SERVER_REVOKE_TIMEOUT = Duration.seconds(10);
-
-/**
- * Only the running server can close a revoked client's open connections, so a
- * revoke goes through it when one is up. Offline, the database write is enough.
- */
-const revokeThroughServer = Effect.fn("auth.revokeThroughServer")(function* <
-  A,
-  E,
-  LiveError,
->(input: {
-  readonly environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"];
-  readonly config: ServerConfig.ServerConfig["Service"];
-  readonly live: (
-    client: HttpApiClient.ForApi<typeof EnvironmentHttpApi>,
-    headers: { readonly authorization: string },
-  ) => Effect.Effect<A, LiveError>;
-  readonly offline: Effect.Effect<A, E>;
-}) {
-  const runtimeState = yield* readLiveServerRuntimeState(input.config.serverRuntimeStatePath);
-  if (Option.isNone(runtimeState)) return yield* input.offline;
-  const viaServer = yield* Effect.acquireUseRelease(
-    input.environmentAuth.issueSession({
-      scopes: [AuthAccessWriteScope],
-      subject: "auth-cli",
-      label: "t3 auth cli",
-      // Outlives the request; the release revokes it, and this bounds it if that never runs.
-      ttl: Duration.minutes(2),
-    }),
-    (issued) =>
-      HttpApiClient.make(EnvironmentHttpApi, { baseUrl: runtimeState.value.origin }).pipe(
-        Effect.flatMap((client) => input.live(client, { authorization: `Bearer ${issued.token}` })),
-        Effect.timeout(LIVE_SERVER_REVOKE_TIMEOUT),
-        Effect.provide(FetchHttpClient.layer),
-      ),
-    (issued) =>
-      input.environmentAuth.revokeSession(issued.sessionId).pipe(Effect.ignore({ log: true })),
-  ).pipe(Effect.option);
-  if (Option.isSome(viaServer)) return viaServer.value;
-  yield* Console.error(
-    `The running server at ${runtimeState.value.origin} did not answer. Revoked in the database; ` +
-      "restart the server to close connections the client already has open.",
-  );
-  return yield* input.offline;
-});
+/** Access changes go through a running server, which applies them to its open connections. */
+const changeAccess = <A, LiveError, LiveR, OfflineError, OfflineR>(
+  environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"],
+  config: ServerConfig.ServerConfig["Service"],
+  live: (
+    client: RunningServer.ServerClient,
+    headers: RunningServer.ServerClientHeaders,
+  ) => Effect.Effect<A, LiveError, LiveR>,
+  offline: Effect.Effect<A, OfflineError, OfflineR>,
+) =>
+  RunningServer.changeState({
+    environmentAuth,
+    config,
+    scopes: [AuthAccessWriteScope],
+    label: "t3 auth cli",
+    live,
+    offline,
+  });
 
 const ttlFlag = Flag.String("ttl").pipe(
   Flag.withSchema(DurationFromString),
@@ -207,9 +172,15 @@ const pairingRevokeCommand = Command.make("revoke", {
 }).pipe(
   Command.withDescription("Revoke an active client pairing token."),
   Command.withHandler((flags) =>
-    runWithEnvironmentAuth(flags, (environmentAuth) =>
+    runWithEnvironmentAuth(flags, (environmentAuth, config) =>
       Effect.gen(function* () {
-        const revoked = yield* environmentAuth.revokePairingLink(flags.id);
+        const { revoked } = yield* changeAccess(
+          environmentAuth,
+          config,
+          (client, headers) =>
+            client.auth.revokePairingLink({ headers, payload: { id: flags.id } }),
+          environmentAuth.revokePairingLink(flags.id).pipe(Effect.map((revoked) => ({ revoked }))),
+        );
         yield* Console.log(
           revoked
             ? `Revoked pairing credential ${flags.id}.\n`
@@ -258,9 +229,23 @@ const connectDeviceApproveCommand = Command.make("approve", {
 }).pipe(
   Command.withDescription("Approve the waiting T3 Connect device that shows this code."),
   Command.withHandler((flags) =>
-    runWithEnvironmentAuth(flags, (environmentAuth) =>
+    runWithEnvironmentAuth(flags, (environmentAuth, config) =>
       Effect.gen(function* () {
-        const approved = yield* environmentAuth.approveConnectDeviceByCode(flags.code);
+        const matches = yield* environmentAuth.connectRequestsShowingCode(flags.code);
+        // Two waiting devices that share a code are ambiguous; approve neither.
+        const pairingLinkId = matches.length === 1 ? matches[0] : undefined;
+        const { approved } =
+          pairingLinkId === undefined
+            ? { approved: false }
+            : yield* changeAccess(
+                environmentAuth,
+                config,
+                (client, headers) =>
+                  client.auth.approveConnectDevice({ headers, payload: { pairingLinkId } }),
+                environmentAuth
+                  .approveConnectDevice(pairingLinkId)
+                  .pipe(Effect.map((approved) => ({ approved }))),
+              );
         yield* Console.log(
           approved
             ? `Approved ${flags.code}. The device connects on its next try.\n`
@@ -282,18 +267,18 @@ const connectDeviceRevokeCommand = Command.make("revoke", {
         const matches = yield* environmentAuth.connectDevicesShowingCode(flags.code);
         const device = matches.length === 1 ? matches[0] : undefined;
         if (device !== undefined) {
-          yield* revokeThroughServer({
+          yield* changeAccess(
             environmentAuth,
             config,
-            live: (client, headers) =>
+            (client, headers) =>
               client.auth.revokeConnectDevice({
                 headers,
                 payload: { proofKeyThumbprint: device.proofKeyThumbprint },
               }),
-            offline: environmentAuth
+            environmentAuth
               .revokeConnectDevice(device.proofKeyThumbprint)
               .pipe(Effect.map((revoked) => ({ revoked }))),
-          });
+          );
         }
         yield* Console.log(
           device !== undefined
@@ -382,15 +367,15 @@ const sessionRevokeCommand = Command.make("revoke", {
   Command.withHandler((flags) =>
     runWithEnvironmentAuth(flags, (environmentAuth, config) =>
       Effect.gen(function* () {
-        const { revoked } = yield* revokeThroughServer({
+        const { revoked } = yield* changeAccess(
           environmentAuth,
           config,
-          live: (client, headers) =>
+          (client, headers) =>
             client.auth.revokeClient({ headers, payload: { sessionId: flags.sessionId } }),
-          offline: environmentAuth
+          environmentAuth
             .revokeSession(flags.sessionId)
             .pipe(Effect.map((revoked) => ({ revoked }))),
-        });
+        );
         yield* Console.log(
           revoked
             ? `Revoked session ${flags.sessionId}.\n`

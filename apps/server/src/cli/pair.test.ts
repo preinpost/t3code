@@ -29,6 +29,8 @@ import {
   SERVICE_LAUNCHER_PROTOCOL,
 } from "../cloud/serviceProtocol.ts";
 import * as ServiceLauncherClient from "../cloud/serviceLauncherClient.ts";
+import * as ProcessRunner from "../processRunner.ts";
+import * as ServerOwnership from "../serverOwnership.ts";
 import {
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
@@ -695,53 +697,78 @@ describe("auth session revoke", () => {
   it.effect.each([
     { server: "answers", label: "goes through a running server, which closes open connections" },
     { server: "absent", label: "writes the database when no server runs" },
-    { server: "silent", label: "writes the database when the running server does not answer" },
+    { server: "gone", label: "writes the database when the recorded server has stopped" },
+    { server: "unreachable", label: "changes nothing when a running server does not answer" },
   ] as const)("$label", ({ server }) =>
     provideCliTestLayers(
       Effect.gen(function* () {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-cli-revoke-test-"));
+        const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
         const issued = JSON.parse(
           yield* captureStdout(
             runCli(["auth", "session", "issue", "--base-dir", baseDir, "--json"]),
           ),
         ) as { readonly sessionId: string };
         if (server !== "absent") {
+          // Nothing listens on port 1, so only "answers" gets a response.
           yield* persistServerRuntimeState({
-            path: NodePath.join(baseDir, "userdata", "server-runtime.json"),
-            state: { ...baseState, pid: process.pid },
+            path: statePath,
+            state: { ...baseState, pid: process.pid, port: 1, origin: "http://127.0.0.1:1" },
           });
         }
+        if (server === "unreachable") {
+          yield* ServerOwnership.acquireServerOwnership(statePath).pipe(
+            Effect.provide(ProcessRunner.layer),
+          );
+        }
         const requests: Array<{ readonly path: string; readonly body: unknown }> = [];
-        yield* runCli(["auth", "session", "revoke", "--base-dir", baseDir, issued.sessionId]).pipe(
-          Effect.provideService(FetchHttpClient.Fetch, async (input, init) => {
-            if (server === "silent") return new Response(null, { status: 502 });
-            requests.push({
-              path: new URL(String(input)).pathname,
-              body: JSON.parse(String(init?.body)),
-            });
-            return Response.json({ revoked: true });
-          }),
-        );
+        const revokeCommand = runCli([
+          "auth",
+          "session",
+          "revoke",
+          "--base-dir",
+          baseDir,
+          issued.sessionId,
+        ]);
+        const revoke = yield* (
+          server === "answers"
+            ? revokeCommand.pipe(
+                Effect.provideService(FetchHttpClient.Fetch, async (input, init) => {
+                  requests.push({
+                    path: new URL(String(input)).pathname,
+                    body: JSON.parse(String(init?.body)),
+                  });
+                  return Response.json({ revoked: true });
+                }),
+              )
+            : revokeCommand
+        ).pipe(Effect.exit);
         const listed = JSON.parse(
           yield* captureStdout(
             runCli(["auth", "session", "list", "--base-dir", baseDir, "--json"]),
           ),
         ) as ReadonlyArray<{ readonly sessionId: string }>;
 
-        if (server === "answers") {
-          assert.deepEqual(requests, [
-            { path: "/api/auth/clients/revoke", body: { sessionId: issued.sessionId } },
-          ]);
-          // The fake server revoked nothing; the CLI's own short-lived session is gone.
-          assert.deepEqual(
-            listed.map((session) => session.sessionId),
-            [issued.sessionId],
+        assert.deepEqual(
+          requests,
+          server === "answers"
+            ? [{ path: "/api/auth/clients/revoke", body: { sessionId: issued.sessionId } }]
+            : [],
+        );
+        if (server === "unreachable") {
+          assert.include(
+            Cause.pretty(Exit.isFailure(revoke) ? revoke.cause : Cause.empty),
+            "RunningServerRequestError",
           );
         } else {
-          assert.deepEqual(requests, []);
-          assert.deepEqual(listed, []);
+          assert.isTrue(Exit.isSuccess(revoke));
         }
-      }),
+        // The fake server revoked nothing, and the CLI's own short-lived session is always gone.
+        assert.deepEqual(
+          listed.map((session) => session.sessionId),
+          server === "answers" || server === "unreachable" ? [issued.sessionId] : [],
+        );
+      }).pipe(Effect.scoped),
     ),
   );
 });
